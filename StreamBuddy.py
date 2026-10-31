@@ -1,141 +1,187 @@
-import os
-import vlc
-import time
-import argparse
-import xml.etree.ElementTree as ET
-import logging
-import tkinter as tk
-from tkinter import filedialog
-import urllib.parse
+"""Play local XSPF playlists with rotating bumpers and OBS text-file banners."""
 
-#Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import argparse
+import logging
+import os
+from pathlib import Path
+import time
+import urllib.parse
+from urllib.request import url2pathname
+import xml.etree.ElementTree as ET
+
+try:
+    import vlc
+except (ImportError, OSError):
+    vlc = None
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except ImportError:
+    tk = filedialog = None
+
+
+class StreamBuddyError(ValueError):
+    """An operational error that can be shown without a Python traceback."""
+
 logger = logging.getLogger(__name__)
 
-# Function to select a folder
+STARTUP_TIMEOUT = 15.0
+STALL_TIMEOUT = 30.0
+TEST_DURATION = 5.0
+POLL_INTERVAL = 0.1
+
+def _select_path(dialog_title, filetypes=None):
+    if tk is None:
+        raise StreamBuddyError("Tkinter is unavailable. Install Tk support for your Python to use the setup dialogs.")
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        if filetypes is not None:
+            return filedialog.askopenfilename(parent=root, title=dialog_title, filetypes=filetypes)
+        return filedialog.askdirectory(parent=root, title=dialog_title)
+    except tk.TclError as exc:
+        raise StreamBuddyError(f"Cannot open the setup dialogs. Check Tk and your graphical desktop: {exc}") from exc
+    finally:
+        if root is not None:
+            root.destroy()
+
+
 def select_folder(dialog_title="Select a folder"):
-    root = tk.Tk()  # Create a root window
-    root.withdraw()  # Hide the root window
+    return _select_path(dialog_title)
 
-    folder_selected = filedialog.askdirectory(title=dialog_title)  # Open folder selection dialog
-    return folder_selected
-# Select a file function
+
 def select_file(dialog_title="Select a file", filetypes=None):
-    """
-    Open a file selection dialog.
-
-    Args:
-        dialog_title (str): Title for the file selection dialog.
-        filetypes (list): List of tuples specifying the file types to filter. Each tuple contains a description and a file extension pattern.
-
-    Returns:
-        str: Path of the selected file.
-    """
-    root = tk.Tk()  # Create a root window
-    root.withdraw()  # Hide the root window
-
     if filetypes is None:
         filetypes = [("All files", "*.*")]
-
-    file_selected = filedialog.askopenfilename(title=dialog_title, filetypes=filetypes)
-    return file_selected
-
-
+    return _select_path(dialog_title, filetypes)
 
 #Assemble your video list
 # Video list from folder
 def get_video_files(folder_path):
-    video_extensions = ['.mp4', '.avi', '.mkv', '.flv', '.mov']
-    files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.splitext(f)[1] in video_extensions]
-    return sorted(files)
+    if not folder_path:
+        raise StreamBuddyError("Select a bumper folder.")
+    video_extensions = {'.mp4', '.avi', '.mkv', '.flv', '.mov'}
+    try:
+        files = sorted(
+            str(path) for path in Path(folder_path).iterdir()
+            if path.is_file() and path.suffix.lower() in video_extensions
+        )
+    except OSError as exc:
+        raise StreamBuddyError(f"Cannot read bumper folder '{folder_path}': {exc}") from exc
+    if not files:
+        raise StreamBuddyError(f"No supported bumper videos found in '{folder_path}'.")
+    return files
 
 #Video list from .xspf
 def queueBuilder(file_path):
-    # Parse the XML file
-    tree = ET.parse(file_path)
-    root = tree.getroot()
-
-    # Namespace for XSPF
+    """Read an XSPF playlist of local files, preserving track order."""
+    if not file_path:
+        raise StreamBuddyError("Select an XSPF playlist.")
+    try:
+        root = ET.parse(file_path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise StreamBuddyError(f"Cannot read XSPF playlist '{file_path}': {exc}") from exc
     ns = {'xspf': 'http://xspf.org/ns/0/'}
-    
-    # List to hold the queue
+    tracks = root.findall('xspf:trackList/xspf:track', ns)
+    if not tracks:
+        raise StreamBuddyError(f"Playlist '{file_path}' contains no tracks.")
     queue = []
-
-    # Iterate through each track in the playlist
-    for track in root.findall('xspf:trackList/xspf:track/xspf:location', ns):
-        location = track.text
-        # Remove the "file://" prefix from the location
-        location_cleaned = location.replace("file:///", "")
-        # Decode the URL-encoded path
-        location_decoded = urllib.parse.unquote(location_cleaned)
-        queue.append(location_decoded)
-
+    for number, track in enumerate(tracks, 1):
+        location = (track.findtext('xspf:location', default='', namespaces=ns) or '').strip()
+        if not location:
+            raise StreamBuddyError(f"Track {number} has no location in '{file_path}'.")
+        try:
+            uri = urllib.parse.urlsplit(location)
+            if uri.scheme not in ('', 'file') or uri.query or uri.fragment:
+                raise ValueError("Only local file locations are supported; encode special characters in the URI.")
+            uri_path = uri.path
+            if uri.netloc and uri.netloc.lower() != 'localhost':
+                if os.name != 'nt':
+                    raise ValueError("Mount network media locally and use its local file path.")
+                uri_path = '//' + uri.netloc + uri_path
+            path = Path(url2pathname(uri_path))
+            if not path.is_absolute():
+                path = Path(file_path).absolute().parent / path
+            if not path.is_file():
+                raise ValueError(f"Media file not found: {path}")
+        except (OSError, ValueError) as exc:
+            raise StreamBuddyError(f"Track {number}: {exc}") from exc
+        queue.append(str(path))
     return queue
 
 #Handles playing the current video (banner or episode)
 def play_video(video_path, test_mode=False, banner_folder_path=None):
-    logger.info(f"Attempting to play video: {video_path}")
-    
-    # Initialize VLC instance
-    if test_mode:
-        vlc_instance = vlc.Instance("--no-xlib --quiet")
-        logger.info("VLC Test instance initialized.")
-    else:
-        vlc_instance = vlc.Instance("--no-xlib --quiet --fullscreen")
-        logger.info("VLC instance initialized.")
-    
-    # Create a new media player object
-    player = vlc_instance.media_player_new()
-    logger.info("Media player object created.")
-    
-    # Set media resource locator
-    player.set_mrl(video_path)
-    logger.info(f"Media resource locator set to: {video_path}")
-    
-    # Play the video
-    player.play()
-    logger.info("Play command sent to VLC player.")
-    
-    # Wait for the video to start playing
-    while not player.is_playing():
-        logger.debug("Waiting for video to start playing...")
-        time.sleep(1)
-    
-    # Try to get the duration until a valid duration is fetched
-    duration_milliseconds = 0
-    while duration_milliseconds <= 0:
-        duration_milliseconds = player.get_length()
-        time.sleep(0.5)  # Slight delay before rechecking
-    
-    duration_seconds = duration_milliseconds / 1000
-    logger.info(f"Video duration: {duration_seconds} seconds")
-    
-    if test_mode:
-        player.set_fullscreen(False)
-        logger.info("Test mode active. Playing video for 5 seconds only.")
-        time.sleep(20)
-        player.stop()
-    else:
-        player.set_fullscreen(True)
-        
-        # Sleep until 2 seconds before the video ends (ensure non-negative value)
-        sleep_time = max(0, duration_seconds - 2)
-        time.sleep(sleep_time)
-        
-        # Remove the title text overlay from OBS
-        logger.info('Clearing OBS title text...')
-        set_obs_text_title("", "", "", banner_folder_path)
-        
-        # Sleep for the remaining time or at least 2 seconds
-        time.sleep(min(2, duration_seconds - sleep_time))
-        
-        # Wait for video to finish playing
-        while player.is_playing():
-            logger.debug("Video is playing...")
-            time.sleep(1)
-        
-        logger.info("Video playback completed.")
-        player.stop()
+    """Play a local file, watching state/position instead of sleeping its duration."""
+    if not Path(video_path).is_file():
+        raise StreamBuddyError(f"Media file not found: {video_path}")
+    if vlc is None:
+        raise StreamBuddyError("VLC is unavailable. Install VLC and run: python -m pip install -r requirements.txt")
+    instance = player = media = None
+    try:
+        try:
+            instance = vlc.Instance('--quiet', '--no-video-title-show')
+        except (OSError, NameError, AttributeError) as exc:
+            raise StreamBuddyError("Cannot initialize VLC. Install VLC and python-vlc for this Python architecture.") from exc
+        if instance is None:
+            raise StreamBuddyError("Cannot initialize VLC. Check the VLC installation.")
+        player = instance.media_player_new()
+        media = instance.media_new_path(os.path.abspath(video_path))
+        if player is None or media is None:
+            raise StreamBuddyError(f"VLC could not create a player for '{video_path}'.")
+        player.set_media(media)
+        player.set_fullscreen(not test_mode)
+        logger.info("Playing %s%s", video_path, " (five-second test)" if test_mode else "")
+        if player.play() == -1:
+            raise StreamBuddyError(f"VLC could not start playback: {video_path}")
+
+        startup_deadline = time.monotonic() + STARTUP_TIMEOUT
+        started_at = None
+        last_progress_at = None
+        last_position = None
+        banner_cleared = False
+        while True:
+            state = player.get_state()
+            now = time.monotonic()
+            if state == vlc.State.Error:
+                raise StreamBuddyError(f"VLC reported a playback error: {video_path}")
+            if state == vlc.State.Ended:
+                # Some demux failures go straight from Opening to Ended. Keep
+                # accepting tiny valid clips that finish between state polls.
+                if started_at is None and player.get_time() <= 0 and player.get_length() <= 0:
+                    raise StreamBuddyError(f"VLC ended without playing any media: {video_path}")
+                return
+            if started_at is None:
+                if state == vlc.State.Playing:
+                    started_at = last_progress_at = now
+                elif now >= startup_deadline:
+                    raise StreamBuddyError(f"VLC did not start within {STARTUP_TIMEOUT:g} seconds: {video_path}")
+            if started_at is not None:
+                if state == vlc.State.Stopped:
+                    raise StreamBuddyError(f"VLC stopped before the video ended: {video_path}")
+                if test_mode and now - started_at >= TEST_DURATION:
+                    return
+                position = player.get_time()
+                if position >= 0 and position != last_position:
+                    last_position = position
+                    last_progress_at = now
+                elif now - last_progress_at >= STALL_TIMEOUT:
+                    raise StreamBuddyError(f"Playback made no progress for {STALL_TIMEOUT:g} seconds: {video_path}")
+                if banner_folder_path and not banner_cleared and not test_mode:
+                    length = player.get_length()
+                    if length > 0 and position >= max(0, length - 2000):
+                        set_obs_text_title('', '', '', banner_folder_path)
+                        banner_cleared = True
+            time.sleep(POLL_INTERVAL)
+    finally:
+        # Attempt every cleanup step, preserving the original failure/interrupt.
+        for resource, action in [(player, 'stop'), (player, 'release'), (media, 'release'), (instance, 'release')]:
+            if resource is not None:
+                try:
+                    getattr(resource, action)()
+                except Exception as exc:
+                    logger.warning("VLC cleanup (%s) failed: %s", action, exc)
 
 
 
@@ -170,96 +216,97 @@ def set_obs_text_title(last_episode_title, current_episode_title, next_episode_t
     if next_episode_title is None:
         next_episode_title = "Thanks for watching!"
     
-    logger.info(f"Setting OBS title text to: Last: {last_episode_title}, Current: {current_episode_title},  Next: {next_episode_title}")
-    
-    # Define the file paths for the three text files
-    last_episode_file = os.path.join(banner_folder_path, "last_episode.txt")
-    current_episode_file = os.path.join(banner_folder_path, "current_episode.txt")
-    next_episode_file = os.path.join(banner_folder_path, "next_episode.txt")
-
-    # Helper function to write to a file and log the action
-    def write_and_log(file_path, content):
+    if not banner_folder_path or not Path(banner_folder_path).is_dir():
+        raise StreamBuddyError("Select an existing folder for the OBS banner text files.")
+    titles = {
+        'last_episode.txt': last_episode_title,
+        'current_episode.txt': current_episode_title,
+        'next_episode.txt': next_episode_title,
+    }
+    failures = []
+    for filename, content in titles.items():
+        path = Path(banner_folder_path) / filename
         try:
-            with open(file_path, 'w') as file:
-                file.write(content)
-            logger.info(f"Updated {file_path} with: {content}")
-        except Exception as e:
-            logger.error(f"Error updating {file_path}: {e}")
-
-    # Update the three text files
-    write_and_log(last_episode_file, last_episode_title)
-    write_and_log(current_episode_file, current_episode_title)
-    write_and_log(next_episode_file, next_episode_title)
+            path.write_text(content, encoding='utf-8')
+        except OSError as exc:
+            failures.append((path, exc))
+    if failures:
+        details = '; '.join(f"{path}: {exc}" for path, exc in failures)
+        raise StreamBuddyError(f"Cannot write banner file(s): {details}") from failures[0][1]
 
 #Main function
 def main(test_mode=False):
-
-    # SET ENV VARIABLES HERE 
-    queue_xspf_location = select_file(dialog_title="Select an XSPF playlist", filetypes=[("XSPF files", "*.xspf"), ("All files", "*.*")])
-    logger.info('Set up a folder with three text files for the banner text. The text files should be named lastEpisode.txt, currentEpisode.txt, and nextEpisode.txt.')
-    banner_folder_path = select_folder("Select a folder with banner text files")
-    bumper_video_folder_path = select_folder("Select a folder with bumper videos")
-    #banner_video = select_file(dialog_title="Select a banner video", filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")])
-    
-    #Set up indexes for looping
-    current_episode_index = -1
-    bumper_index = 0
-    logger.info('Loading video and bumper queue...')
-    
-    #video_queue = queueBuilder(folder_path)
-    #Q: how do I use queueBuilder instead of queueBuilder?
-    video_queue = queueBuilder(queue_xspf_location)
-    bumper_queue = get_video_files(bumper_video_folder_path)
+    """Validate setup, then repeat complete playlists until stopped."""
+    banner_folder_path = None
+    banners_initialized = False
+    status = 0
     try:
+        playlist_path = select_file(dialog_title="Select an XSPF playlist", filetypes=[("XSPF files", "*.xspf"), ("All files", "*.*")])
+        if not playlist_path:
+            logger.info("Setup canceled.")
+            return 0
+        video_queue = queueBuilder(playlist_path)
+        logger.info("OBS text files: last_episode.txt, current_episode.txt, next_episode.txt (created automatically).")
+        banner_folder_path = select_folder("Select a folder for OBS banner text files")
+        if not banner_folder_path:
+            logger.info("Setup canceled.")
+            return 0
+        bumper_folder_path = select_folder("Select a folder with bumper videos")
+        if not bumper_folder_path:
+            logger.info("Setup canceled.")
+            return 0
+        bumper_queue = get_video_files(bumper_folder_path)
+        # Fail before playback if the selected output directory cannot be written.
+        banners_initialized = True
+        set_obs_text_title('', '', '', banner_folder_path)
+        bumper_index = 0
+        last_title = None
         while True:
-            if not video_queue or current_episode_index == len(video_queue) - 1:
-                logger.info('Reloading video queue from folder...')
-                video_queue = queueBuilder(queue_xspf_location)
-                current_episode_index = 0
-
-            # Get the last, current, and next episode titles
-            last_episode = video_queue[current_episode_index - 1] if current_episode_index > 0 else None
-            current_episode = video_queue[current_episode_index]
-            next_episode = video_queue[current_episode_index + 1] if current_episode_index < len(video_queue) - 1 else None
-
-            # Extract titles
-            last_episode_title = extract_episode_title(os.path.basename(last_episode)) if last_episode else None
-            current_episode_title = extract_episode_title(os.path.basename(current_episode))
-            next_episode_title = extract_episode_title(os.path.basename(next_episode)) if next_episode else None
-
-            # Set the title text of the next episode on OBS
-            #logger.info(f'Setting OBS title text to: Last: {last_episode_title}, Current: {current_episode_title},  Next: {next_episode_title}')
-            set_obs_text_title(last_episode_title, current_episode_title, next_episode_title, banner_folder_path)
-        
-            # Increment the index for next iteration (simulate playing the current episode)
-            current_episode_index += 1
-
-            # Play bumper video
-            current_bumper_video = bumper_queue[bumper_index]
-            logger.info(f'Playing bumper video: {current_bumper_video}')
-            play_video(current_bumper_video, test_mode=test_mode, banner_folder_path=banner_folder_path)
-
-
-            # Remove the title text overlay from OBS
-            logger.info('Clearing OBS title text...')
-            set_obs_text_title("", "", "", banner_folder_path)
-
-            # Increment bumper index or reset if we've reached the end of bumper_queue
-            bumper_index = (bumper_index + 1) % len(bumper_queue)
-
-            # Play the next episode
-            next_episode = video_queue.pop(0)
-            logger.info(f'Playing episode: {next_episode}')
-            play_video(next_episode, test_mode=test_mode)
-    
+            for index, episode in enumerate(video_queue):
+                current_title = extract_episode_title(os.path.basename(episode))
+                next_title = (
+                    extract_episode_title(os.path.basename(video_queue[index + 1]))
+                    if index + 1 < len(video_queue) else None
+                )
+                set_obs_text_title(last_title, current_title, next_title, banner_folder_path)
+                play_video(bumper_queue[bumper_index], test_mode=test_mode, banner_folder_path=banner_folder_path)
+                set_obs_text_title('', '', '', banner_folder_path)
+                bumper_index = (bumper_index + 1) % len(bumper_queue)
+                play_video(episode, test_mode=test_mode)
+                last_title = current_title
+            logger.info("Reloading completed playlist.")
+            video_queue = queueBuilder(playlist_path)
     except KeyboardInterrupt:
-        # If you interrupt the script (e.g., Ctrl+C), it will disconnect gracefully
-        logger.info('Killing StreamBuddy...')
+        logger.info("Stopping StreamBuddy.")
+    except (StreamBuddyError, OSError) as exc:
+        logger.error("%s", exc)
+        status = 1
+    finally:
+        if banners_initialized:
+            try:
+                set_obs_text_title('', '', '', banner_folder_path)
+            except (StreamBuddyError, OSError) as exc:
+                logger.error("Could not clear OBS banners: %s", exc)
+                status = 1
+    return status
+
+
+def cli(argv=None):
+    """Both launchers share argument parsing and dependency diagnostics."""
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    parser = argparse.ArgumentParser(description='StreamBuddy script to manage video playback in VLC with OBS integration.')
+    parser.add_argument('--test', action='store_true', help='Play each video in a window for up to 5 seconds.')
+    args = parser.parse_args(argv)
+    missing = []
+    if vlc is None:
+        missing.append('VLC/python-vlc: install VLC, then run python -m pip install -r requirements.txt')
+    if tk is None:
+        missing.append('Tkinter: install Tk support for your Python distribution')
+    if missing:
+        logger.error('Missing playback/setup dependencies: %s. See README.md.', '; '.join(missing))
+        return 1
+    return main(test_mode=args.test)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='StreamBuddy script to manage video playback in VLC with OBS integration.')
-    parser.add_argument('--test', action='store_true', help='Enable test mode to play each video for 5 seconds only.')
-    args = parser.parse_args()
-
-    main(test_mode=args.test)
+    raise SystemExit(cli())
